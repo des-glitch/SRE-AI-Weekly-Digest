@@ -3,26 +3,16 @@
 """
 全球运维与 AI 周报生成核心脚本 (sre_ai_report_generator.py)
 
-功能：
-1. **模块化调用**：拆分为 6 个独立的 AI 调用，每次调用只获取一个模块的数据。
-2. **超长超时**：每个 API 请求的超时时间设置为 120 秒，确保 AI 有充足时间响应。
-3. **独立存储**：每次成功获取数据后，立即写入对应的 Notion 数据库。
-4. **邮件通知**：收集所有数据后，格式化为 HTML 并发送邮件。
-
-更新：
-- 结构大重构，将单次复杂调用拆分为 6 次简单的调用。
-- **单个请求超时设置为 120 秒。**
-- **重试等待时间设置为 60 秒 (第一次), 120 秒 (第二次), ...**
-
-运行环境依赖：
-pip install requests notion-client sendgrid
+**重要说明：**
+1. 已根据用户提供的 6 个数据库设计图，使用英文 Field Name (如 'title', 'summary', 'official_link') 作为 Notion 属性键。
+2. AI (Gemini) 的 JSON 输出结构已相应调整，确保数据能精确映射到 Notion 字段。
 """
 
 import os
 import requests
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 外部库导入
 try:
@@ -36,12 +26,12 @@ except ImportError:
 
 # Notion 数据库 IDs
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-NOTION_DB_REPORT = os.environ.get("NOTION_DB_REPORT") # 周报主表
-NOTION_DB_SRE_DYNAMICS = os.environ.get("NOTION_DB_SRE_DYNAMICS") # 运维行业动态
-NOTION_DB_FAILURE_INCIDENTS = os.environ.get("NOTION_DB_FAILURE_INCIDENTS") # 全球故障信息
-NOTION_DB_AI_NEWS = os.environ.get("NOTION_DB_AI_NEWS") # AI 前沿资讯
-NOTION_DB_AI_LEARNING = os.environ.get("NOTION_DB_AI_LEARNING") # AI 学习推荐
-NOTION_DB_AI_BUSINESS = os.environ.get("NOTION_DB_AI_BUSINESS") # AI 商业机会
+NOTION_DB_REPORT = os.environ.get("NOTION_DB_REPORT") # 1. 周报主表 (Report)
+NOTION_DB_SRE_DYNAMICS = os.environ.get("NOTION_DB_SRE_DYNAMICS") # 2. 运维行业动态 (SRE_Dynamics)
+NOTION_DB_FAILURE_INCIDENTS = os.environ.get("NOTION_DB_FAILURE_INCIDENTS") # 3. 全球故障信息 (Failure_Incidents)
+NOTION_DB_AI_NEWS = os.environ.get("NOTION_DB_AI_NEWS") # 4. AI 前沿资讯 (AI_News)
+NOTION_DB_AI_LEARNING = os.environ.get("NOTION_DB_AI_LEARNING") # 5. AI 学习推荐 (AI_Learning)
+NOTION_DB_AI_BUSINESS = os.environ.get("NOTION_DB_AI_BUSINESS") # 6. AI 商业机会 (AI_Business_Opportunity)
 
 # SendGrid Configuration
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
@@ -53,9 +43,7 @@ FROM_EMAIL = GMAIL_RECIPIENT_EMAILS[0] if GMAIL_RECIPIENT_EMAILS else None
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # --- Timing & Robustness Constants ---
-# 单个 API 请求的最大等待时间 (120秒)
 REQUEST_TIMEOUT_SECONDS = 120 
-# 第一次重试的等待时间 (60秒) - 已根据用户要求修改
 INITIAL_RETRY_SLEEP = 60 
 MAX_RETRIES = 3 
 
@@ -133,19 +121,19 @@ def _gemini_api_call(prompt_text):
         
         except requests.exceptions.RequestException as e:
             if attempt < MAX_RETRIES - 1:
-                # 指数退避：60s, 120s, 240s...
                 wait_time = INITIAL_RETRY_SLEEP * (2 ** attempt)
                 print(f"Gemini API Call Failed (Transient Error: {e}). Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
             else:
                 print(f"Gemini API Call Failed after {MAX_RETRIES} attempts: {e}")
-                # 发送邮件通知最终失败
                 error_message = f"AI Analysis Failed (Final attempt timeout/error): {e}"
                 send_email_notification(GMAIL_RECIPIENT_EMAILS, "SRE/AI 报告生成失败 (API 错误)", error_message)
                 return None
         
         except ValueError as e:
             print(f"Gemini API Content Check Failed: {e}")
+            error_message = f"AI Analysis Failed (Missing content): {e}"
+            send_email_notification(GMAIL_RECIPIENT_EMAILS, "SRE/AI 报告生成失败 (AI内容错误)", error_message)
             return None
             
         except Exception as e:
@@ -174,7 +162,6 @@ def _parse_gemini_response(raw_text, task_name):
         print("--- FULL RAW TEXT (JSON PARSE FAILED) ---")
         print(raw_text) 
         print("---------------------------------------")
-        # 通知邮件中加入原始文本，便于调试
         error_message = f"AI 返回的 JSON 格式错误 ({task_name}): {e}\n\n请检查 AI 响应的原始文本:\n{raw_text[:2000]}"
         send_email_notification(GMAIL_RECIPIENT_EMAILS, f"SRE/AI 报告生成失败 (JSON解析错误) - {task_name}", error_message)
         return None
@@ -196,166 +183,268 @@ def _create_notion_page(db_id, properties):
         )
     except Exception as e:
         print(f"Failed to create Notion page in DB {db_id}: {e}")
+        print(f"Failed properties were: {properties}")
+        print("Hint: This is usually due to property key names not matching your Notion database column headers (English Field Name) exactly.")
 
-# --- Modular Prompts and Schemas ---
+
+# --- Modular Prompts and Schemas (Using English Field Names) ---
 
 def _get_overall_summary():
-    """Step 1: Get Report Metadata and Overall Summary."""
-    task_name = "Overall Summary"
+    """Step 1: Get Report Metadata and Overall Summary (for Report Master DB)."""
+    task_name = "Report Master"
+    
+    # 获取本周的起始和结束日期 (假设周报为过去 7 天)
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=6)
+    
+    report_week_start = start_date.strftime("%Y-%m-%d")
+    report_week_end = end_date.strftime("%Y-%m-%d")
+    
+    # 按照 Report 表的字段设计 JSON Schema
     schema = {
-        "reportDate": datetime.now().strftime("%Y-%m-%d"),
-        "overallSummary": "本周全球 SRE 领域主要关注 AIOps 的落地和云成本优化，AI 领域重点是多模态模型的商用进展...",
+        "title": f"全球运维与 AI 周报 ({report_week_start} - {report_week_end})",
+        "report_week_start": report_week_start,
+        "report_week_end": report_week_end,
+        "status": "Draft",
+        "overall_summary": "本周全球 SRE 领域主要关注 AIOps 的落地和云成本优化，AI 领域重点是多模态模型的商用进展...",
     }
     
     prompt = f"""
-请根据可联网搜索到的过去一周（七天）的行业新闻和技术进展，生成周报的**报告日期**和**本周总体摘要**。
+请根据可联网搜索到的过去一周（{report_week_start} 至 {report_week_end}）的行业新闻和技术进展，生成周报的**标题**和**本周总体摘要**（overall_summary）。
 周报的主题是全球 SRE 运维和人工智能领域。
 请严格按照以下 JSON 结构返回数据，**不允许添加任何 Markdown 格式或额外文本**。
-JSON 结构: {json.dumps(schema, indent=4, ensure_ascii=False)}
+JSON 结构中的 'title'、'report_week_start' 和 'report_week_end' 请使用我提供的预设值。
+JSON 结构: {{
+    "title": "{schema['title']}",
+    "report_week_start": "{schema['report_week_start']}",
+    "report_week_end": "{schema['report_week_end']}",
+    "status": "Draft",
+    "overall_summary": "此处填写本周运维与AI领域的综合性总结"
+}}
 """
     raw_text = _gemini_api_call(prompt)
-    return _parse_gemini_response(raw_text, task_name)
+    data = _parse_gemini_response(raw_text, task_name)
+    
+    if data:
+        # 整合数据以供 Notion 写入
+        report_properties = {
+            "title": { "title": [{"text": {"content": data.get('title', 'N/A')}}] },
+            "report_week_start": { "date": {"start": data.get('report_week_start', report_week_start)} },
+            "report_week_end": { "date": {"start": data.get('report_week_end', report_week_end)} },
+            "status": { "select": {"name": data.get('status', 'Draft')} },
+        }
+        _create_notion_page(NOTION_DB_REPORT, report_properties)
+        data['report_week_start'] = report_week_start # 确保日期在返回结果中
+        data['report_week_end'] = report_week_end
+    
+    return data
 
 
 def _get_sre_dynamics():
-    """Step 2: Get SRE Dynamics data."""
+    """Step 2: Get SRE Dynamics data (for SRE_Dynamics DB)."""
     task_name = "SRE Dynamics"
+    # 严格按照 SRE_Dynamics 表的 Field Name 设计 JSON Schema
     schema = {
         "sreDynamics": [
-            {"title": "Google 发布下一代 SRE 实践指南", "summary": "指南强调了 SLI/SLO 的动态调整和混沌工程...", "source": "https://example.com/sre-guide"},
-            {"title": "大规模云故障案例分析", "summary": "分析了某云服务商因配置管理不当导致的 1 小时全球中断...", "source": "https://example.com/cloud-incident"}
+            {
+                "title": "Google 发布下一代 SRE 实践指南", 
+                "summary": "指南强调了 SLI/SLO 的动态调整和混沌工程...", 
+                "source_company": "Google",
+                "release_date": datetime.now().strftime("%Y-%m-%d"),
+                "official_link": "https://example.com/sre-guide",
+                "focus_areas": ["AIOps", "Chaos Engineering"],
+                "analysis_content": "该报告表明 SRE 正在从被动响应转向主动弹性设计..."
+            },
         ]
     }
     prompt = f"""
 请根据可联网搜索到的信息，提供至少 **2-3 条** 全球 SRE 和云原生领域的关键技术进展或最佳实践。
 请严格按照以下 JSON 结构返回数据，**不允许添加任何 Markdown 格式或额外文本**。
+注意：'release_date' 必须是 YYYY-MM-DD 格式，'focus_areas' 必须是字符串数组。
 JSON 结构: {json.dumps(schema, indent=4, ensure_ascii=False)}
 """
     raw_text = _gemini_api_call(prompt)
     data = _parse_gemini_response(raw_text, task_name)
+    
     if data and data.get('sreDynamics'):
         for item in data['sreDynamics']:
+            # 使用英文 Field Name
             dynamic_properties = {
-                "动态标题": { "title": [{"text": {"content": item.get('title', 'N/A')}}] },
-                "摘要": { "rich_text": [{"text": {"content": item.get('summary', 'N/A')}}] },
-                "来源链接": { "url": item.get('source', None) }
+                "title": { "title": [{"text": {"content": item.get('title', 'N/A')}}] },
+                "summary": { "rich_text": [{"text": {"content": item.get('summary', 'N/A')}}] },
+                "source_company": { "rich_text": [{"text": {"content": item.get('source_company', 'N/A')}}] },
+                "release_date": { "date": {"start": item.get('release_date', datetime.now().strftime("%Y-%m-%d"))} },
+                "official_link": { "url": item.get('official_link', None) },
+                "focus_areas": { "multi_select": [{"name": area} for area in item.get('focus_areas', [])] },
+                "analysis_content": { "rich_text": [{"text": {"content": item.get('analysis_content', 'N/A')}}] },
             }
             _create_notion_page(NOTION_DB_SRE_DYNAMICS, dynamic_properties)
     return data
 
 
-def _get_failure_incidents(report_date):
-    """Step 3: Get Global Failure Incidents data."""
+def _get_failure_incidents():
+    """Step 3: Get Global Failure Incidents data (for Failure_Incidents DB)."""
     task_name = "Failure Incidents"
+    # 严格按照 Failure_Incidents 表的 Field Name 设计 JSON Schema
     schema = {
         "failureIncidents": [
-            {"incidentID": "INC-2025-09-01-001", "impact": "全球服务中断 30 分钟", "rootCause": "数据库连接池饱和", "mitigation": "紧急扩容并限制连接数", "reportedTime": "2025-09-01T10:00:00Z"},
-            {"incidentID": "INC-2025-09-05-002", "impact": "部分地区延迟增加", "rootCause": "CDN 节点缓存污染", "mitigation": "强制刷新 CDN 缓存", "reportedTime": "2025-09-05T15:30:00Z"}
+            {
+                "incident_title": "数据库连接池饱和导致全球服务中断", 
+                "company": "大型云服务商", 
+                "incident_date": "2025-09-01T10:00:00Z", # 使用 ISO 8601 Timestamp 格式
+                "official_link": "https://example.com/incident-report-001",
+                "overview": "服务中断 30 分钟，影响全球多个区域。",
+                "root_cause": "数据库连接池饱和，未能及时扩容",
+                "timeline": "10:00 - 发现告警；10:15 - 紧急扩容；10:30 - 服务恢复。",
+                "improvement_measures": "实施连接池弹性伸缩机制并限制连接数。",
+                "lessons_learned": "在高并发场景下，连接池的动态管理至关重要。"
+            },
         ]
     }
     prompt = f"""
-请根据可联网搜索到的信息，提供至少 **2 条** 过去一周发生的具有影响力的、公开披露的全球性服务故障（如云服务商、大型 SaaS 或互联网公司）。
-必须包含故障编号 (incidentID)、影响 (impact)、根本原因 (rootCause)、缓解措施 (mitigation) 和报告时间 (reportedTime, 务必使用 ISO 8601 格式，如 T20:00:00Z)。
+请根据可联网搜索到的信息，提供至少 **2 条** 过去一周发生的具有影响力的、公开披露的全球性服务故障。
+必须包含所有字段：incident_title, company, official_link (链接), overview, root_cause, improvement_measures, incident_date (务必使用 ISO 8601 Timestamp 格式，如 YYYY-MM-DDTHH:MM:SSZ)。
 请严格按照以下 JSON 结构返回数据，**不允许添加任何 Markdown 格式或额外文本**。
 JSON 结构: {json.dumps(schema, indent=4, ensure_ascii=False)}
 """
     raw_text = _gemini_api_call(prompt)
     data = _parse_gemini_response(raw_text, task_name)
+    
     if data and data.get('failureIncidents'):
         for item in data['failureIncidents']:
+            # 使用英文 Field Name
             incident_properties = {
-                "故障编号": { "title": [{"text": {"content": item.get('incidentID', 'N/A')}}] },
-                "影响": { "rich_text": [{"text": {"content": item.get('impact', 'N/A')}}] },
-                "根本原因": { "rich_text": [{"text": {"content": item.get('rootCause', 'N/A')}}] },
-                "缓解措施": { "rich_text": [{"text": {"content": item.get('mitigation', 'N/A')}}] },
-                # 检查并使用报告时间，如果时间格式不对，退回到报告日期
-                "报告时间": {
-                    "date": {"start": item.get('reportedTime', report_date) if item.get('reportedTime') else report_date}
-                }
+                "incident_title": { "title": [{"text": {"content": item.get('incident_title', 'N/A')}}] },
+                "company": { "rich_text": [{"text": {"content": item.get('company', 'N/A')}}] },
+                "incident_date": { "date": {"start": item.get('incident_date', datetime.now().isoformat() + 'Z')} }, # Notion Date Type with time
+                "official_link": { "url": item.get('official_link', None) },
+                "overview": { "rich_text": [{"text": {"content": item.get('overview', 'N/A')}}] },
+                "root_cause": { "rich_text": [{"text": {"content": item.get('root_cause', 'N/A')}}] },
+                "timeline": { "rich_text": [{"text": {"content": item.get('timeline', 'N/A')}}] },
+                "improvement_measures": { "rich_text": [{"text": {"content": item.get('improvement_measures', 'N/A')}}] },
+                "lessons_learned": { "rich_text": [{"text": {"content": item.get('lessons_learned', 'N/A')}}] },
             }
             _create_notion_page(NOTION_DB_FAILURE_INCIDENTS, incident_properties)
     return data
 
 
 def _get_ai_news():
-    """Step 4: Get AI News data."""
+    """Step 4: Get AI News data (for AI_News DB)."""
     task_name = "AI News"
+    # 严格按照 AI_News 表的 Field Name 设计 JSON Schema
     schema = {
         "aiNews": [
-            {"title": "OpenAI 推出 GPT-5，具备原生多模态能力", "summary": "新模型在长文本理解和图像生成方面取得突破性进展...", "source": "https://example.com/gpt5"},
-            {"title": "欧盟通过 AI 法案最终版本", "summary": "对高风险 AI 应用提出严格监管要求...", "source": "https://example.com/eu-ai-act"}
+            {
+                "title": "OpenAI 推出 GPT-5，具备原生多模态能力", 
+                "summary": "新模型在长文本理解和图像生成方面取得突破性进展...", 
+                "source": "OpenAI 官网",
+                "publish_date": datetime.now().strftime("%Y-%m-%d"),
+                "news_link": "https://example.com/gpt5",
+                "category": "Model Release (模型发布)",
+                "analysis": "GPT-5 的发布加速了多模态在商业应用中的普及。"
+            },
         ]
     }
     prompt = f"""
 请根据可联网搜索到的信息，提供至少 **2-3 条** 关于模型、算法、监管或硬件的重大 AI 前沿资讯。
 请严格按照以下 JSON 结构返回数据，**不允许添加任何 Markdown 格式或额外文本**。
+注意：'publish_date' 必须是 YYYY-MM-DD 格式。
 JSON 结构: {json.dumps(schema, indent=4, ensure_ascii=False)}
 """
     raw_text = _gemini_api_call(prompt)
     data = _parse_gemini_response(raw_text, task_name)
+    
     if data and data.get('aiNews'):
         for item in data['aiNews']:
+            # 使用英文 Field Name
             news_properties = {
-                "资讯标题": { "title": [{"text": {"content": item.get('title', 'N/A')}}] },
-                "摘要": { "rich_text": [{"text": {"content": item.get('summary', 'N/A')}}] },
-                "来源链接": { "url": item.get('source', None) }
+                "title": { "title": [{"text": {"content": item.get('title', 'N/A')}}] },
+                "summary": { "rich_text": [{"text": {"content": item.get('summary', 'N/A')}}] },
+                "source": { "rich_text": [{"text": {"content": item.get('source', 'N/A')}}] },
+                "publish_date": { "date": {"start": item.get('publish_date', datetime.now().strftime("%Y-%m-%d"))} },
+                "news_link": { "url": item.get('news_link', None) },
+                "category": { "select": {"name": item.get('category', 'N/A')} },
+                "analysis": { "rich_text": [{"text": {"content": item.get('analysis', 'N/A')}}] },
             }
             _create_notion_page(NOTION_DB_AI_NEWS, news_properties)
     return data
 
 
 def _get_ai_learning():
-    """Step 5: Get AI Learning data."""
+    """Step 5: Get AI Learning data (for AI_Learning DB)."""
     task_name = "AI Learning"
+    # 严格按照 AI_Learning 表的 Field Name 设计 JSON Schema
     schema = {
         "aiLearning": [
-            {"resourceName": "《深度学习系统设计》", "type": "书籍", "reason": "深入理解大型模型训练与推理的架构。", "link": "https://example.com/deep-learning-book"},
-            {"resourceName": "AIOps 落地实践系列课程", "type": "在线课程", "reason": "教授如何使用 ML 预测系统故障和自动化运维。", "link": "https://example.com/aiops-course"}
+            {
+                "material_name": "《深度学习系统设计》", 
+                "description": "深入理解大型模型训练与推理的架构。", 
+                "type": "Book (书籍)",
+                "difficulty": "Advanced (高级)",
+                "link": "https://example.com/deep-learning-book",
+                "tags": ["LLM", "System Design"]
+            },
         ]
     }
     prompt = f"""
-请根据可联网搜索到的信息，提供至少 **2 个** 值得推荐的学习资源，包括名称、类型（书籍/课程/博客）、推荐理由和链接。
+请根据可联网搜索到的信息，提供至少 **2 个** 值得推荐的学习资源，包括名称、类型（如：Book (书籍), Course (课程), Video Series (视频系列)）、难度（如：Beginner (初级), Intermediate (中级), Advanced (高级)）和链接。
 资源主题应围绕 SRE、AIOps 或前沿 AI 技术。
 请严格按照以下 JSON 结构返回数据，**不允许添加任何 Markdown 格式或额外文本**。
+注意：'tags' 必须是字符串数组。
 JSON 结构: {json.dumps(schema, indent=4, ensure_ascii=False)}
 """
     raw_text = _gemini_api_call(prompt)
     data = _parse_gemini_response(raw_text, task_name)
+    
     if data and data.get('aiLearning'):
         for item in data['aiLearning']:
+            # 使用英文 Field Name
             learning_properties = {
-                "资源名称": { "title": [{"text": {"content": item.get('resourceName', 'N/A')}}] },
-                "类型": { "select": {"name": item.get('type', 'N/A')} },
-                "推荐理由": { "rich_text": [{"text": {"content": item.get('reason', 'N/A')}}] },
-                "链接": { "url": item.get('link', None) }
+                "material_name": { "title": [{"text": {"content": item.get('material_name', 'N/A')}}] },
+                "description": { "rich_text": [{"text": {"content": item.get('description', 'N/A')}}] },
+                "type": { "select": {"name": item.get('type', 'N/A')} },
+                "difficulty": { "select": {"name": item.get('difficulty', 'N/A')} },
+                "link": { "url": item.get('link', None) },
+                "tags": { "multi_select": [{"name": tag} for tag in item.get('tags', [])] },
             }
             _create_notion_page(NOTION_DB_AI_LEARNING, learning_properties)
     return data
 
 
 def _get_ai_business():
-    """Step 6: Get AI Business Opportunity data."""
+    """Step 6: Get AI Business Opportunity data (for AI_Business_Opportunity DB)."""
     task_name = "AI Business Opportunity"
+    # 严格按照 AI_Business_Opportunity 表的 Field Name 设计 JSON Schema
     schema = {
         "aiBusinessOpportunity": [
-            {"field": "医疗诊断", "opportunity": "基于大模型的辅助诊疗工具，可以快速分析医学影像。", "marketPotential": "高", "risk": "中"},
-            {"field": "智能客服", "opportunity": "集成 RAG 技术的企业级知识库问答系统，替代传统工单。", "marketPotential": "中高", "risk": "低"}
+            {
+                "opportunity_title": "基于 RAG 的垂直知识库 SaaS", 
+                "description": "为特定行业（如医疗）提供定制化的 RAG 解决方案，解决企业内部知识检索效率问题。", 
+                "potential_market": "医疗行业, 零售电商",
+                "value_proposition": "提供高准确率和低成本的知识检索服务，显著提高专家工作效率。",
+                "trend_reference": "多模态大模型的推理能力增强",
+                "estimated_effort": "Medium (中)",
+            },
         ]
     }
     prompt = f"""
-请根据可联网搜索到的信息，提供至少 **2 个** 基于当前 AI 技术的潜在商业化方向，包括领域、机会描述、市场潜力（高/中高/中/低）和风险评估（高/中/低）。
+请根据可联网搜索到的信息，提供至少 **2 个** 基于当前 AI 技术的潜在商业化方向，包括商机标题、详细描述、潜在市场、价值主张、支撑趋势和预估投入（如：Low (低), Medium (中), High (高)）。
 请严格按照以下 JSON 结构返回数据，**不允许添加任何 Markdown 格式或额外文本**。
 JSON 结构: {json.dumps(schema, indent=4, ensure_ascii=False)}
 """
     raw_text = _gemini_api_call(prompt)
     data = _parse_gemini_response(raw_text, task_name)
+    
     if data and data.get('aiBusinessOpportunity'):
         for item in data['aiBusinessOpportunity']:
+            # 使用英文 Field Name
             biz_properties = {
-                "领域": { "title": [{"text": {"content": item.get('field', 'N/A')}}] },
-                "机会描述": { "rich_text": [{"text": {"content": item.get('opportunity', 'N/A')}}] },
-                "市场潜力": { "select": {"name": item.get('marketPotential', 'N/A')} },
-                "风险": { "select": {"name": item.get('risk', 'N/A')} }
+                "opportunity_title": { "title": [{"text": {"content": item.get('opportunity_title', 'N/A')}}] },
+                "description": { "rich_text": [{"text": {"content": item.get('description', 'N/A')}}] },
+                "potential_market": { "rich_text": [{"text": {"content": item.get('potential_market', 'N/A')}}] },
+                "value_proposition": { "rich_text": [{"text": {"content": item.get('value_proposition', 'N/A')}}] },
+                "trend_reference": { "rich_text": [{"text": {"content": item.get('trend_reference', 'N/A')}}] },
+                "estimated_effort": { "select": {"name": item.get('estimated_effort', 'N/A')} }
             }
             _create_notion_page(NOTION_DB_AI_BUSINESS, biz_properties)
     return data
@@ -366,28 +455,36 @@ def _format_html_report(all_data):
     """Format the complete analysis data into an HTML report for email."""
     
     # 提取顶层信息
-    report_date = all_data.get('overallSummaryData', {}).get('reportDate', datetime.now().strftime('%Y年%m月%d日'))
-    overall_summary = all_data.get('overallSummaryData', {}).get('overallSummary', 'N/A')
+    report_week_start = all_data.get('overallSummaryData', {}).get('report_week_start', datetime.now().strftime('%Y-%m-%d'))
+    report_week_end = all_data.get('overallSummaryData', {}).get('report_week_end', datetime.now().strftime('%Y-%m-%d'))
+    report_title = all_data.get('overallSummaryData', {}).get('title', f"全球运维与 AI 周报 ({report_week_start} - {report_week_end})")
+    overall_summary = all_data.get('overallSummaryData', {}).get('overall_summary', 'N/A')
 
-    def list_to_html(title, data_key, keys_to_display):
+    def list_to_html(title, data_key, display_fields):
         """Generates HTML table for lists from collected data."""
+        # display_fields 格式: {"中文表头": "英文 Field Name"}
         items = all_data.get(data_key, [])
         if not items: return ""
         
         html = f'<div class="section"><h2 class="section-title">{title}</h2><div class="table-container">'
         html += '<table class="data-table"><thead><tr>'
-        for key in keys_to_display:
-            html += f'<th>{key}</th>'
+        for cn_header in display_fields.keys():
+            html += f'<th>{cn_header}</th>'
         html += '</tr></thead><tbody>'
         
         for item in items:
             html += '<tr>'
-            for key_cn, key_en in keys_to_display.items():
-                value = item.get(key_en, 'N/A')
-                if key_en in ['source', 'link']: # Handle URL links
-                    value = f'<a href="{value}" target="_blank">查看链接</a>' if value else 'N/A'
+            for cn_header, en_key in display_fields.items():
+                value = item.get(en_key, 'N/A')
                 
-                if key_en == 'incidentID':
+                # 特殊处理链接字段
+                if en_key in ['official_link', 'news_link', 'link']:
+                    value = f'<a href="{value}" target="_blank">查看链接</a>' if value else 'N/A'
+                # 特殊处理 Array of Strings (Multi-Select)
+                elif isinstance(value, list):
+                    value = ", ".join(value)
+                
+                if cn_header in ['动态标题', '故障标题', '标题', '资源名称', '商机标题']:
                     html += f'<td><strong>{value}</strong></td>'
                 else:
                     html += f'<td>{value}</td>'
@@ -396,26 +493,27 @@ def _format_html_report(all_data):
         html += '</tbody></table></div></div>'
         return html
 
-    sre_dynamics_html = list_to_html("运维行业动态 (SRE Dynamics)", 'sreDynamics', 
-                                     {"标题": "title", "摘要": "summary", "来源": "source"})
+    # 使用中文显示名称和英文 Field Name 映射
+    sre_dynamics_html = list_to_html("2. 运维行业动态 (SRE Dynamics)", 'sreDynamics', 
+                                     {"动态标题": "title", "摘要": "summary", "发布机构/公司": "source_company", "链接": "official_link"})
     
-    failure_incidents_html = list_to_html("全球故障信息 (Failure Incidents)", 'failureIncidents', 
-                                          {"故障编号": "incidentID", "影响": "impact", "根本原因": "rootCause", "缓解措施": "mitigation", "报告时间": "reportedTime"})
+    failure_incidents_html = list_to_html("3. 全球故障信息 (Failure Incidents)", 'failureIncidents', 
+                                          {"故障标题": "incident_title", "公司": "company", "概览": "overview", "根因": "root_cause", "日期": "incident_date", "链接": "official_link"})
 
-    ai_news_html = list_to_html("AI 前沿资讯 (AI News)", 'aiNews',
-                                {"标题": "title", "摘要": "summary", "来源": "source"})
+    ai_news_html = list_to_html("4. AI 前沿资讯 (AI News)", 'aiNews',
+                                {"标题": "title", "摘要": "summary", "来源": "source", "类别": "category", "链接": "news_link"})
 
-    ai_learning_html = list_to_html("AI 学习推荐 (AI Learning)", 'aiLearning',
-                                    {"资源名称": "resourceName", "类型": "type", "推荐理由": "reason", "链接": "link"})
+    ai_learning_html = list_to_html("5. AI 学习推荐 (AI Learning)", 'aiLearning',
+                                    {"资源名称": "material_name", "类型": "type", "难度": "difficulty", "推荐理由": "description", "链接": "link"})
 
-    ai_business_html = list_to_html("AI 商业机会 (AI Business Opportunity)", 'aiBusinessOpportunity',
-                                    {"领域": "field", "机会描述": "opportunity", "市场潜力": "marketPotential", "风险": "risk"})
+    ai_business_html = list_to_html("6. AI 商业机会 (AI Business Opportunity)", 'aiBusinessOpportunity',
+                                    {"商机标题": "opportunity_title", "描述": "description", "潜在市场": "potential_market", "预估投入": "estimated_effort"})
 
     html_content = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>全球运维与 AI 周报 - {report_date}</title>
+        <title>{report_title}</title>
         <meta charset="utf-8">
         <style>
             body {{ font-family: 'Inter', sans-serif; margin: 0; padding: 20px; background-color: #f4f7f6; color: #333; }}
@@ -437,12 +535,12 @@ def _format_html_report(all_data):
     <body>
         <div class="container">
             <div class="header">
-                <h1>全球运维与 AI 周报</h1>
-                <p>生成日期: {report_date} | 由 Gemini AI 驱动</p>
+                <h1>{report_title}</h1>
+                <p>覆盖日期: {report_week_start} - {report_week_end} | 由 Gemini AI 驱动</p>
             </div>
 
             <div class="section">
-                <h2 class="section-title">本周总体摘要</h2>
+                <h2 class="section-title">1. 本周总体摘要 (Overall Summary)</h2>
                 <div class="content">
                     <p>{overall_summary}</p>
                 </div>
@@ -483,23 +581,13 @@ def main():
     }
     
     # --- Step 1: Get Overall Summary & Report Date (Mandatory First Step) ---
-    print("\n--- Step 1/6: Getting Overall Summary and Report Date ---")
+    print("\n--- Step 1/6: Getting Overall Summary and Report Date (Report Master) ---")
     summary_data = _get_overall_summary()
     if not summary_data:
         print("Fatal: Could not get Overall Summary. Aborting all subsequent steps.")
         return
     
-    # Save to Report Master DB
     all_report_data['overallSummaryData'] = summary_data
-    report_date = summary_data.get('reportDate', datetime.now().strftime("%Y-%m-%d"))
-    overall_summary = summary_data.get('overallSummary', 'N/A')
-    
-    report_properties = {
-        "标题": { "title": [{"text": {"content": f"全球运维与 AI 周报 - {report_date}"}}] },
-        "报告日期": { "date": {"start": report_date} },
-        "摘要": { "rich_text": [{"text": {"content": overall_summary}}] }
-    }
-    _create_notion_page(NOTION_DB_REPORT, report_properties)
     print("Step 1 Complete: Report Master page created.")
 
     # --- Step 2 to 6: Sequential Data Collection and Saving ---
@@ -513,7 +601,8 @@ def main():
 
     # 3. Failure Incidents
     print("\n--- Step 3/6: Getting Failure Incidents ---")
-    incident_data = _get_failure_incidents(report_date)
+    # 注意：故障事件不需要依赖 Report Date
+    incident_data = _get_failure_incidents()
     if incident_data and incident_data.get('failureIncidents'):
         all_report_data['failureIncidents'] = incident_data['failureIncidents']
     print("Step 3 Complete.")
@@ -542,8 +631,8 @@ def main():
     # --- Final Step: Send Email Notification ---
     print("\n--- Final Step: Formatting and sending email notification ---")
     html_report = _format_html_report(all_report_data)
-    subject = f"【SRE/AI 周报】全球运维与 AI 行业分析 - {report_date}"
-    send_email_notification(GMAIL_RECIPIENT_EMAILS, subject, html_report)
+    subject = all_report_data['overallSummaryData'].get('title', "SRE/AI 周报")
+    send_email_notification(GMAIL_RECIPIENT_EMAILS, f"【周报】{subject}", html_report)
     
     print("\nScript finished. All available data has been processed and notified.")
 
