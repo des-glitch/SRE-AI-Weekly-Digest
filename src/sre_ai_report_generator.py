@@ -9,8 +9,9 @@
 3. 将完整报告格式化为 HTML，通过 SendGrid 发送邮件通知。
 
 运行环境依赖：
-pip install requests notion-client sendgrid firebase-admin
+pip install requests notion-client sendgrid
 """
+
 import os
 import requests
 import json
@@ -18,7 +19,6 @@ from datetime import datetime
 from notion_client import Client
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
-from firebase_admin import credentials, initialize_app, firestore
 
 # --- Configuration & Environment Variables ---
 
@@ -37,32 +37,12 @@ gmail_emails_str = os.environ.get("GMAIL_RECIPIENT_EMAILS")
 GMAIL_RECIPIENT_EMAILS = [email.strip() for email in gmail_emails_str.split(',')] if gmail_emails_str else []
 FROM_EMAIL = GMAIL_RECIPIENT_EMAILS[0] if GMAIL_RECIPIENT_EMAILS else None
 
-# Firebase Configuration
-FIREBASE_CONFIG_JSON = os.environ.get("FIREBASE_CONFIG_JSON")
-APP_ID = os.environ.get("__app_id")
-
 # Gemini Configuration
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # --- Initialize Clients ---
 notion = Client(auth=NOTION_TOKEN)
 
-# Initialize Firebase Admin SDK
-db = None
-if FIREBASE_CONFIG_JSON and APP_ID:
-    try:
-        firebase_config = json.loads(FIREBASE_CONFIG_JSON)
-        cred = credentials.Certificate(firebase_config)
-        try:
-            initialize_app(cred)
-        except ValueError:
-            pass # App already initialized
-        db = firestore.client()
-        print("Firebase Admin SDK initialized.")
-    except Exception as e:
-        print(f"Failed to initialize Firebase Admin SDK: {e}")
-else:
-    print("Firebase config/app_id missing. Firestore disabled.")
 
 # --- SendGrid Email Function ---
 def send_email_notification(to_list, subject, message_text):
@@ -129,9 +109,9 @@ def _get_gemini_analysis():
 请根据可联网搜索到的过去一周（七天）的行业新闻和技术进展，生成一份结构化周报。
 **核心要求：** 请不要在JSON结构的前后添加任何额外文本、解释或免责声明。请将所有分析结果以**严格的JSON格式**返回。
 **任务列表：**
-1. **SRE Dynamics (运维行业动态)**：至少 2-5 条全球 SRE 和云原生领域的关键技术进展或最佳实践。
-2. **Failure Incidents (全球故障信息)**：至少 2~5 条过去一周发生的具有影响力的、公开披露的全球性服务故障（如云服务商、大型 SaaS 或互联网公司），必须包含故障编号 (incidentID)、影响 (impact)、根本原因 (rootCause)、缓解措施 (mitigation) 和报告时间 (reportedTime)。
-3. **AI News (AI 前沿资讯)**：至少 2-5 条关于模型、算法、监管或硬件的重大新闻。
+1. **SRE Dynamics (运维行业动态)**：至少 2-3 条全球 SRE 和云原生领域的关键技术进展或最佳实践。
+2. **Failure Incidents (全球故障信息)**：至少 2 条过去一周发生的具有影响力的、公开披露的全球性服务故障（如云服务商、大型 SaaS 或互联网公司），必须包含故障编号 (incidentID)、影响 (impact)、根本原因 (rootCause)、缓解措施 (mitigation) 和报告时间 (reportedTime)。
+3. **AI News (AI 前沿资讯)**：至少 2-3 条关于模型、算法、监管或硬件的重大新闻。
 4. **AI Learning (AI 学习推荐)**：至少 2 个值得推荐的学习资源，包括名称、类型（书籍/课程/博客）、推荐理由和链接。
 5. **AI Business Opportunity (AI 商业机会)**：至少 2 个基于当前 AI 技术的潜在商业化方向，包括领域、机会描述、市场潜力和风险评估。
 6. **Report Summary (周报摘要)**：给出本周 SRE 和 AI 领域的总体摘要。
@@ -302,20 +282,6 @@ def _save_to_notion(data):
         }
         _create_notion_page(NOTION_DB_AI_BUSINESS, biz_properties)
 
-def _save_to_firestore(data):
-    """Save data to Firestore database (latest public report)"""
-    if not db:
-        return False
-    try:
-        # 使用新的集合路径以避免与金融报告冲突
-        doc_ref = db.collection('artifacts').document(APP_ID).collection('public').document('data').collection('sre_ai_reports').document('latest')
-        doc_ref.set(data.copy())
-        print("Successfully wrote data to Firestore.")
-        return True
-    except Exception as e:
-        print(f"Failed to write to Firestore: {e}")
-        return False
-
 # --- HTML Email Formatting ---
 def _format_html_report(data):
     """Format the analysis data into a nice-looking HTML report for email."""
@@ -408,7 +374,7 @@ def _format_html_report(data):
 
             <div class="section">
                 <p style="text-align: center; color: #999; font-size: 12px; margin-top: 40px;">
-                    数据已同步到 Notion 数据库和 Firebase Firestore。
+                    数据已同步到 Notion 数据库。
                 </p>
             </div>
         </div>
@@ -432,10 +398,7 @@ def main():
     # 2. Save data to Notion (6 databases)
     _save_to_notion(analysis_data)
     
-    # 3. Save data to Firestore (for web display/backup)
-    _save_to_firestore(analysis_data)
-
-    # 4. Send email notification
+    # 3. Send email notification
     html_report = _format_html_report(analysis_data)
     subject = f"【SRE/AI 周报】全球运维与 AI 行业分析 - {analysis_data.get('reportDate')}"
     send_email_notification(GMAIL_RECIPIENT_EMAILS, subject, html_report)
