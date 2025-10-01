@@ -1,0 +1,57 @@
+name: SRE & AI Weekly Report Generator
+
+on:
+  # 1. 每周日 00:00 UTC 定时运行
+  schedule:
+    - cron: '0 0 * * 0'
+  # 2. 允许手动从 Actions 界面触发或推送到 main 分支时运行
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  generate_sre_ai_report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          # 仅安装本项目必需的库
+          pip install requests notion-client sendgrid firebase-admin
+
+      - name: Run SRE/AI Report Script
+        env:
+          # --- 核心 API Keys ---
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          
+          # --- Notion 同步配置 (1个 Token + 6个 DB ID) ---
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_REPORT: ${{ secrets.NOTION_DB_REPORT }}
+          NOTION_DB_SRE_DYNAMICS: ${{ secrets.NOTION_DB_SRE_DYNAMICS }}
+          NOTION_DB_FAILURE_INCIDENTS: ${{ secrets.NOTION_DB_FAILURE_INCIDENTS }}
+          NOTION_DB_AI_NEWS: ${{ secrets.NOTION_DB_AI_NEWS }}
+          NOTION_DB_AI_LEARNING: ${{ secrets.NOTION_DB_AI_LEARNING }}
+          NOTION_DB_AI_BUSINESS: ${{ secrets.NOTION_DB_AI_BUSINESS }}
+          
+          # --- SendGrid 邮件发送配置 ---
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }} 
+          GMAIL_RECIPIENT_EMAILS: ${{ secrets.GMAIL_RECIPIENT_EMAILS }} 
+          
+          # --- Firestore 数据库配置 ---
+          FIREBASE_CONFIG_JSON: ${{ secrets.FIREBASE_CONFIG_JSON }}
+          __app_id: ${{ secrets.__APP_ID }}
+          
+        run: |
+          echo "Starting the SRE/AI weekly report generation..."
+          python src/sre_ai_report_generator.py
+          echo "Script finished."
