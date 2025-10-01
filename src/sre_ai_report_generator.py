@@ -15,6 +15,7 @@ pip install requests notion-client sendgrid
 import os
 import requests
 import json
+import time # 引入 time 库用于等待
 from datetime import datetime
 from notion_client import Client
 from sendgrid import SendGridAPIClient
@@ -67,12 +68,15 @@ def send_email_notification(to_list, subject, message_text):
         print(f"Failed to send email via SendGrid: {e}")
 
 # --- Gemini API Call ---
-def _get_gemini_analysis():
-    """Call Gemini API to get the structured SRE/AI report data."""
+def _get_gemini_analysis(max_retries=3):
+    """
+    Call Gemini API to get the structured SRE/AI report data with exponential backoff retries.
+    """
     if not GEMINI_API_KEY:
         print("GEMINI_API_KEY not set. Cannot call AI.")
         return None
         
+    # --- Prompt and Schema Definition (Same as before) ---
     json_schema = {
         "reportDate": datetime.now().strftime("%Y-%m-%d"),
         "overallSummary": "本周全球 SRE 领域主要关注 AIOps 的落地和云成本优化，AI 领域重点是多模态模型的商用进展...",
@@ -83,7 +87,6 @@ def _get_gemini_analysis():
         ],
         
         "failureIncidents": [
-            # 这里的 title 对应 Notion 数据库的主键 "故障编号"
             {"incidentID": "INC-2025-09-01-001", "impact": "全球服务中断 30 分钟", "rootCause": "数据库连接池饱和", "mitigation": "紧急扩容并限制连接数", "reportedTime": "2025-09-01T10:00:00Z"},
             {"incidentID": "INC-2025-09-05-002", "impact": "部分地区延迟增加", "rootCause": "CDN 节点缓存污染", "mitigation": "强制刷新 CDN 缓存", "reportedTime": "2025-09-05T15:30:00Z"}
         ],
@@ -118,29 +121,58 @@ def _get_gemini_analysis():
 
 JSON对象的结构如下：
 """
+    # --- End Prompt Definition ---
     
     prompt_text = f"{prompt_prefix}{json.dumps(json_schema, indent=4, ensure_ascii=False)}"
     
     headers = { "Content-Type": "application/json" }
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={GEMINI_API_KEY}"
     
-    print("Starting Gemini API call for SRE/AI analysis...")
-    try:
-        response = requests.post(api_url, headers=headers, data=json.dumps({"contents": [{"parts": [{"text": prompt_text}]}], "tools": [{"google_search": {}}]}))
-        response.raise_for_status()
-        result_json = response.json()
-        raw_text = result_json['candidates'][0]['content']['parts'][0]['text']
-        print("Successfully retrieved Gemini response.")
-        return raw_text
-    except Exception as e:
-        print(f"Gemini API Call Failed: {e}")
-        return None
+    for attempt in range(max_retries):
+        try:
+            print(f"Starting Gemini API call (Attempt {attempt + 1}/{max_retries})...")
+            response = requests.post(
+                api_url, 
+                headers=headers, 
+                data=json.dumps({"contents": [{"parts": [{"text": prompt_text}]}], "tools": [{"google_search": {}}]}),
+                timeout=30 # 设置超时时间
+            )
+            
+            # 检查是否有 5xx 或 429 (Too Many Requests) 错误
+            if response.status_code >= 500 or response.status_code == 429:
+                raise requests.exceptions.RequestException(f"Transient error: Status {response.status_code}")
+                
+            response.raise_for_status() # 对 4xx 客户端错误抛出异常
+            
+            result_json = response.json()
+            raw_text = result_json['candidates'][0]['content']['parts'][0]['text']
+            print("Successfully retrieved Gemini response.")
+            return raw_text
+        
+        except requests.exceptions.RequestException as e:
+            # 只在非最后一次尝试时进行重试
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt + 1 # 1s, 3s, 7s...
+                print(f"Gemini API Call Failed (Transient Error: {e}). Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                # 最后一次尝试失败，彻底退出
+                print(f"Gemini API Call Failed after {max_retries} attempts: {e}")
+                return None
+        
+        except Exception as e:
+            # 捕获其他非请求错误，如 JSON 解析错误
+            print(f"Gemini API Call Failed unexpectedly: {e}")
+            return None
+    
+    return None
 
 def _parse_gemini_response(raw_text):
     """Parses the raw text response into a dictionary."""
     if not raw_text:
         return None
     try:
+        # Attempt to find the full JSON object
         json_start_index = raw_text.find('{')
         json_end_index = raw_text.rfind('}')
         if json_start_index == -1 or json_end_index == -1:
@@ -155,7 +187,7 @@ def _parse_gemini_response(raw_text):
         send_email_notification(GMAIL_RECIPIENT_EMAILS, "SRE/AI 报告生成失败", f"AI 返回的 JSON 格式错误: {e}\n\n原始文本:\n{raw_text}")
         return None
 
-# --- Notion Saving Helpers ---
+# --- Notion Saving Helpers (Unchanged) ---
 
 def _create_notion_page(db_id, properties):
     """Helper function to create a page in a specific Notion database."""
@@ -167,8 +199,9 @@ def _create_notion_page(db_id, properties):
             parent={"database_id": db_id},
             properties=properties
         )
-        print(f"Successfully created page in DB: {db_id}")
+        # print(f"Successfully created page in DB: {db_id}") # 避免输出过多日志
     except Exception as e:
+        # 此处保留详细错误日志，方便排查权限/ID问题
         print(f"Failed to create Notion page in DB {db_id}: {e}")
 
 def _save_to_notion(data):
@@ -178,7 +211,7 @@ def _save_to_notion(data):
     
     # 1. Report (周报主表) - Single summary page
     report_properties = {
-        "标题": { # 假设主表的主列名为 "标题"
+        "标题": { 
             "title": [
                 {"text": {"content": f"全球运维与 AI 周报 - {report_date}"}}
             ]
@@ -197,7 +230,7 @@ def _save_to_notion(data):
     # 2. SRE Dynamics (运维行业动态) - Multiple pages
     for item in data.get('sreDynamics', []):
         dynamic_properties = {
-            "动态标题": { # 假设主列名为 "动态标题"
+            "动态标题": { 
                 "title": [{"text": {"content": item.get('title', 'N/A')}}]
             },
             "摘要": {
@@ -212,7 +245,6 @@ def _save_to_notion(data):
     # 3. Failure Incidents (全球故障信息) - Multiple pages, uses "title" for IncidentID
     for item in data.get('failureIncidents', []):
         incident_properties = {
-            # 必须使用 'title' 类型，Key 为数据库主列名称 (根据用户上一个问题，假设为 '故障编号')
             "故障编号": { 
                 "title": [{"text": {"content": item.get('incidentID', 'N/A')}}]
             },
@@ -234,7 +266,7 @@ def _save_to_notion(data):
     # 4. AI News (AI 前沿资讯) - Multiple pages
     for item in data.get('aiNews', []):
         news_properties = {
-            "资讯标题": { # 假设主列名为 "资讯标题"
+            "资讯标题": { 
                 "title": [{"text": {"content": item.get('title', 'N/A')}}]
             },
             "摘要": {
@@ -249,10 +281,10 @@ def _save_to_notion(data):
     # 5. AI Learning (AI 学习推荐) - Multiple pages
     for item in data.get('aiLearning', []):
         learning_properties = {
-            "资源名称": { # 假设主列名为 "资源名称"
+            "资源名称": { 
                 "title": [{"text": {"content": item.get('resourceName', 'N/A')}}]
             },
-            "类型": { # 假设为 Select 属性
+            "类型": { 
                 "select": {"name": item.get('type', 'N/A')}
             },
             "推荐理由": {
@@ -267,22 +299,22 @@ def _save_to_notion(data):
     # 6. AI Business Opportunity (AI 商业机会) - Multiple pages
     for item in data.get('aiBusinessOpportunity', []):
         biz_properties = {
-            "领域": { # 假设主列名为 "领域"
+            "领域": { 
                 "title": [{"text": {"content": item.get('field', 'N/A')}}]
             },
             "机会描述": {
                 "rich_text": [{"text": {"content": item.get('opportunity', 'N/A')}}]
             },
-            "市场潜力": { # 假设为 Select 属性
+            "市场潜力": { 
                 "select": {"name": item.get('marketPotential', 'N/A')}
             },
-            "风险": { # 假设为 Select 属性
+            "风险": { 
                 "select": {"name": item.get('risk', 'N/A')}
             }
         }
         _create_notion_page(NOTION_DB_AI_BUSINESS, biz_properties)
 
-# --- HTML Email Formatting ---
+# --- HTML Email Formatting (Unchanged) ---
 def _format_html_report(data):
     """Format the analysis data into a nice-looking HTML report for email."""
     report_date = data.get('reportDate', datetime.now().strftime('%Y年%m月%d日'))
