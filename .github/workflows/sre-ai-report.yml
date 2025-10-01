@@ -48,10 +48,9 @@ jobs:
           GMAIL_RECIPIENT_EMAILS: ${{ secrets.GMAIL_RECIPIENT_EMAILS }} 
           
           # --- Firestore 数据库配置 ---
-          FIREBASE_CONFIG_JSON: ${{ secrets.FIREBASE_CONFIG_JSON }}
+          #FIREBASE_CONFIG_JSON: ${{ secrets.FIREBASE_CONFIG_JSON }}
           #__app_id: ${{ secrets.__APP_ID }}
-          __app_id: ${{ vars.__app_id }}
-          __firebase_config: ${{ secrets.__firebase_config }}
+          #__firebase_config: ${{ secrets.__firebase_config }}
           
         run: |
           echo "Starting the SRE/AI weekly report generation..."
