@@ -11,7 +11,6 @@
 运行环境依赖：
 pip install requests notion-client sendgrid firebase-admin
 """
-o
 import os
 import requests
 import json
