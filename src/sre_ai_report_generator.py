@@ -9,8 +9,9 @@
 3. 将完整报告格式化为 HTML，通过 SendGrid 发送邮件通知。
 
 更新：
-- 增加了对 Gemini API 响应结构的鲁棒性检查。
-- **增强了调试输出，在 API 调用成功和 JSON 解析失败时打印原始文本。**
+- **根据用户要求，调整了重试间隔：30s, 60s, 120s...，以应对频繁的超时问题。**
+- 强化了 Prompt 格式约束，要求 AI 仅返回纯 JSON。
+- 增强了调试输出，在 API 调用成功和 JSON 解析失败时打印原始文本。
 
 运行环境依赖：
 pip install requests notion-client sendgrid
@@ -75,7 +76,6 @@ def send_email_notification(to_list, subject, message_text):
 def _get_gemini_analysis(max_retries=3):
     """
     Call Gemini API to get the structured SRE/AI report data with exponential backoff retries.
-    Adds robust content extraction and debugging output.
     """
     if not GEMINI_API_KEY:
         print("GEMINI_API_KEY not set. Cannot call AI.")
@@ -115,7 +115,14 @@ def _get_gemini_analysis(max_retries=3):
     prompt_prefix = f"""
 你是一名资深的技术专家和行业分析师，擅长全球 SRE 运维和人工智能领域。
 请根据可联网搜索到的过去一周（七天）的行业新闻和技术进展，生成一份结构化周报。
-**核心要求：** 请不要在JSON结构的前后添加任何额外文本、解释或免责声明。请将所有分析结果以**严格的JSON格式**返回。
+
+# 严格输出格式要求 (为避免解析失败，请严格遵守)
+1. **输出必须是纯粹的、完整的JSON对象。**
+2. **不允许在JSON对象的前后添加任何Markdown格式（如```json```）、额外文本、解释或任何注释。**
+3. 请使用**双引号**包裹所有键和字符串值。
+
+**核心要求：** 请将所有分析结果以**严格的JSON格式**返回。
+
 **任务列表：**
 1. **SRE Dynamics (运维行业动态)**：至少 2-3 条全球 SRE 和云原生领域的关键技术进展或最佳实践。
 2. **Failure Incidents (全球故障信息)**：至少 2 条过去一周发生的具有影响力的、公开披露的全球性服务故障（如云服务商、大型 SaaS 或互联网公司），必须包含故障编号 (incidentID)、影响 (impact)、根本原因 (rootCause)、缓解措施 (mitigation) 和报告时间 (reportedTime)。
@@ -176,9 +183,10 @@ JSON对象的结构如下：
             return raw_text
         
         except requests.exceptions.RequestException as e:
-            # 只在非最后一次尝试时进行重试
+            # 仅在非最后一次尝试时进行重试
             if attempt < max_retries - 1:
-                wait_time = 2 ** attempt + 1
+                # 调整重试间隔：30s, 60s, 120s...
+                wait_time = 30 * (2 ** attempt)
                 print(f"Gemini API Call Failed (Transient Error: {e}). Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
             else:
