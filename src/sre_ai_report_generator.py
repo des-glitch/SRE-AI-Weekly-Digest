@@ -4,11 +4,8 @@
 全球运维与 AI 周报生成核心脚本 (sre_ai_report_generator.py)
 
 **本次更新说明：**
-1. 增强 Gemini 提示约束：
-   - 强制要求所有列表项目（步骤 2-6）**至少 3 条，最好 5 条**。
-   - 强制要求所有链接字段（official_link, news_link, link, trend_link）**必须包含一个有效的 URL**，不允许为空。
-2. 保持 Notion 兼容性修复：继续将 Select/Multi-Select 字段发送为 Rich Text，以兼容用户现有数据库配置。
-3. 步骤 6 新增 `trend_link` 字段以提供商业趋势来源。
+1. **【已修复】SRE Dynamics (Focus Areas):** 确认数据库已更改，将 focus_areas 字段的写入类型从 Multi-Select 恢复为 **Rich Text** (富文本)。
+2. **【已修复】AI Business Opportunity (Trend Link):** 确认数据库已添加 trend_link 属性（URL 类型），脚本现在将链接写入该独立字段，并更新了 HTML 报告的展示。
 """
 
 import os
@@ -260,7 +257,7 @@ def _get_sre_dynamics():
                 "source_company": "Google",
                 "release_date": datetime.now().strftime("%Y-%m-%d"),
                 "official_link": "https://example.com/sre-guide",
-                "focus_areas": "AIOps, Chaos Engineering", # 简化为字符串
+                "focus_areas": "AIOps, Chaos Engineering", # 保持为逗号分隔的字符串
                 "analysis_content": "该报告表明 SRE 正在从被动响应转向主动弹性设计..."
             },
         ]
@@ -285,14 +282,16 @@ JSON 结构: {json.dumps(schema, indent=4, ensure_ascii=False)}
             # 只有当链接有效时才发送 None，否则 Notion 会因为空字符串报错
             official_link_value = official_link if official_link and official_link.strip() else None 
 
+            focus_areas_str = item.get('focus_areas', '')
+
             dynamic_properties = {
                 "title": { "title": [{"text": {"content": item.get('title', 'N/A')}}] },
                 "summary": { "rich_text": [{"text": {"content": item.get('summary', 'N/A')}}] },
                 "source_company": { "rich_text": [{"text": {"content": item.get('source_company', 'N/A')}}] },
                 "release_date": { "date": {"start": item.get('release_date', datetime.now().strftime("%Y-%m-%d"))} },
                 "official_link": { "url": official_link_value },
-                # FIX: 强制将 focus_areas 字段转换为 Rich Text (兼容旧的 Notion 配置)
-                "focus_areas": { "rich_text": [{"text": {"content": item.get('focus_areas', '')}}] },
+                # 修复: 确认 focus_areas 字段类型为 Rich Text
+                "focus_areas": { "rich_text": [{"text": {"content": focus_areas_str}}] }, 
                 "analysis_content": { "rich_text": [{"text": {"content": item.get('analysis_content', 'N/A')}}] },
             }
             _create_notion_page(NOTION_DB_SRE_DYNAMICS, dynamic_properties)
@@ -461,7 +460,6 @@ def _get_ai_business():
     """Step 6: Get AI Business Opportunity data (for AI_Business_Opportunity DB)."""
     task_name = "AI Business Opportunity"
     # 严格按照 AI_Business_Opportunity 表的 Field Name 设计 JSON Schema
-    # NOTE: 新增 trend_link 字段用于链接来源
     schema = {
         "aiBusinessOpportunity": [
             {
@@ -470,7 +468,7 @@ def _get_ai_business():
                 "potential_market": "医疗行业, 零售电商",
                 "value_proposition": "提供高准确率和低成本的知识检索服务，显著提高专家工作效率。",
                 "trend_reference": "多模态大模型的推理能力增强",
-                "trend_link": "https://example.com/trend-report-link", # NEW FIELD
+                "trend_link": "https://example.com/trend-report-link", # AI 必须返回此字段
                 "estimated_effort": "Medium (中)", 
             },
         ]
@@ -498,18 +496,18 @@ JSON 结构: {json.dumps(schema, indent=4, ensure_ascii=False)}
             # 使用英文 Field Name
             biz_properties = {
                 "opportunity_title": { "title": [{"text": {"content": item.get('opportunity_title', 'N/A')}}] },
-                "description": { "rich_text": [{"text": {"content": item.get('description', 'N/A')}}] },
+                "description": { "rich_text": [{"text": {"content": item.get('description', 'N/A')}}] }, # 写入原始描述
                 "potential_market": { "rich_text": [{"text": {"content": item.get('potential_market', 'N/A')}}] },
                 "value_proposition": { "rich_text": [{"text": {"content": item.get('value_proposition', 'N/A')}}] },
                 "trend_reference": { "rich_text": [{"text": {"content": item.get('trend_reference', 'N/A')}}] },
-                # FIX: 强制将 estimated_effort 字段转换为 Rich Text (兼容旧的 Notion 配置)
                 "estimated_effort": { "rich_text": [{"text": {"content": item.get('estimated_effort', 'N/A')}}] },
-                "trend_link": { "url": trend_link_value } # NEW FIELD
+                # 修复: 写入 trend_link 属性，使用 URL 类型
+                "trend_link": { "url": trend_link_value },
             }
             _create_notion_page(NOTION_DB_AI_BUSINESS, biz_properties)
     return data
 
-# --- HTML Email Formatting (更新以包含 Step 6 的 trend_link) ---
+# --- HTML Email Formatting ---
 
 def _format_html_report(all_data):
     """Format the complete analysis data into an HTML report for email."""
@@ -537,11 +535,17 @@ def _format_html_report(all_data):
             for cn_header, en_key in display_fields.items():
                 value = item.get(en_key, 'N/A')
                 
-                # 特殊处理链接字段
-                if en_key in ['official_link', 'news_link', 'link', 'trend_link']: # Added trend_link
-                    # 注意：此时 value 可能是 None (null)
-                    value = f'<a href="{value}" target="_blank">查看链接</a>' if value else 'N/A'
-                # 特殊处理 Array of Strings (Multi-Select)，尽管 Notion 存成了 Rich Text，但 AI 输出还是数组或字符串，这里统一处理为字符串显示
+                # 特殊处理链接字段 (包括新增的 trend_link)
+                if en_key in ['official_link', 'news_link', 'link', 'trend_link']: 
+                    # 只有当 value 不为空且是一个有效的 URL 时才显示链接
+                    value = f'<a href="{value}" target="_blank">查看链接</a>' if value and value.startswith('http') else 'N/A'
+                
+                # 针对多行富文本内容 (如 description, summary, root_cause), 将换行符转换为 <br>
+                elif en_key in ['description', 'summary', 'root_cause', 'overview', 'analysis_content', 'value_proposition']:
+                     if isinstance(value, str):
+                         value = value.replace('\n', '<br>')
+                
+                # 通用处理
                 elif isinstance(value, list):
                     value = ", ".join(value)
                 
@@ -556,7 +560,7 @@ def _format_html_report(all_data):
 
     # 使用中文显示名称和英文 Field Name 映射
     sre_dynamics_html = list_to_html("2. 运维行业动态 (SRE Dynamics)", 'sreDynamics', 
-                                     {"动态标题": "title", "摘要": "summary", "发布机构/公司": "source_company", "链接": "official_link"})
+                                     {"动态标题": "title", "摘要": "summary", "领域": "focus_areas", "链接": "official_link"})
     
     failure_incidents_html = list_to_html("3. 全球故障信息 (Failure Incidents)", 'failureIncidents', 
                                           {"故障标题": "incident_title", "公司": "company", "概览": "overview", "根因": "root_cause", "日期": "incident_date", "链接": "official_link"})
@@ -567,8 +571,10 @@ def _format_html_report(all_data):
     ai_learning_html = list_to_html("5. AI 学习推荐 (AI Learning)", 'aiLearning',
                                     {"资源名称": "material_name", "类型": "type", "难度": "difficulty", "推荐理由": "description", "链接": "link"})
 
+    # 修复：AI Business Opportunity 现在 trend_link 是独立字段
     ai_business_html = list_to_html("6. AI 商业机会 (AI Business Opportunity)", 'aiBusinessOpportunity',
-                                    {"商机标题": "opportunity_title", "描述": "description", "潜在市场": "potential_market", "趋势链接": "trend_link", "预估投入": "estimated_effort"})
+                                    {"商机标题": "opportunity_title", "描述": "description", "潜在市场": "potential_market", "预估投入": "estimated_effort", "趋势链接": "trend_link"})
+
 
     html_content = f"""
     <!DOCTYPE html>
