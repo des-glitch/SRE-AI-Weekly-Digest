@@ -216,7 +216,7 @@ def _get_overall_summary():
     prompt = f"""
 请根据可联网搜索到的过去一周（{report_week_start} 至 {report_week_end}）的行业新闻和技术进展，生成周报的**标题**和**本周总体摘要**（overall_summary）。
 周报的主题是全球 SRE 运维和人工智能领域。
-请严格按照以下 JSON 结构返回数据，**不允许添加任何 Markdown 格式或额外文本**。
+请严格按照以下 JSON 结构返回数据，**不允许添加任何 Markdown 格式或额外文本**。**每一个主题后面附加的网页链接都需要确保是正确和可用的**;
 JSON 结构中的 'title'、'report_week_start' 和 'report_week_end' 请使用我提供的预设值。
 JSON 结构: {{
     "title": "{schema['title']}",
